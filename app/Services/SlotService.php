@@ -5,9 +5,14 @@ namespace App\Services;
 use App\Models\Booking;
 use App\Models\Service;
 use App\Models\ServiceOption;
+use Carbon\CarbonImmutable;
+use DateTimeZone;
 
 class SlotService
 {
+    private const MOSCOW_TZ = 'Europe/Moscow';
+    private const UTC_TZ = 'UTC';
+    
     public function __construct(private readonly ScheduleService $scheduleService)
     {
     }
@@ -27,26 +32,50 @@ class SlotService
 
         $day = $dateMsk->format('Y-m-d');
 
-        $startMsk = new \DateTime("$day $startTime", new \DateTimeZone('Europe/Moscow'));
-        $endMsk = new \DateTime("$day $endTime", new \DateTimeZone('Europe/Moscow'));
+        $tzMoscow = new DateTimeZone(self::MOSCOW_TZ);
+        $tzUtc = new DateTimeZone(self::UTC_TZ);
+
+        $startMsk = CarbonImmutable::parse("$day $startTime", $tzMoscow);
+        $endMsk = CarbonImmutable::parse("$day $endTime", $tzMoscow);
 
         // последний возможный старт = end - effective
-        $lastStartMsk = (clone $endMsk)->modify("-$effective minutes");
+        $lastStartMsk = $endMsk->subMinutes($effective);
+
+        $rangeStartUtc = $startMsk->setTimezone($tzUtc);
+        $rangeEndUtc = $endMsk->setTimezone($tzUtc);
+
+        $bookedIntervals = Booking::query()
+            ->where('service_id', $service->id)
+            ->where('status', 'booked')
+            ->where('starts_at', '<', $rangeEndUtc->format('Y-m-d H:i:s.u'))
+            ->where('ends_at', '>', $rangeStartUtc->format('Y-m-d H:i:s.u'))
+            ->get(['starts_at', 'ends_at'])
+            ->map(static function (Booking $booking) use ($tzUtc): array {
+                $start = CarbonImmutable::parse($booking->starts_at, $tzUtc)->getTimestamp();
+                $end = CarbonImmutable::parse($booking->ends_at, $tzUtc)->getTimestamp();
+
+                return ['start' => $start, 'end' => $end];
+            })
+            ->all();
 
         $slots = [];
-        for ($t = clone $startMsk; $t <= $lastStartMsk; $t->modify("+$step minutes")) {
-            $startUtc = (clone $t)->setTimezone(new \DateTimeZone('UTC'));
-            $endUtc = (clone $startUtc)->modify("+$effective minutes");
+        for ($cursor = $startMsk; $cursor->lte($lastStartMsk); $cursor = $cursor->addMinutes($step)) {
+            $slotStartUtc = $cursor->setTimezone($tzUtc);
+            $slotEndUtc = $slotStartUtc->addMinutes($effective);
 
-            $overlap = Booking::query()
-                ->where('service_id', $service->id)
-                ->where('status', 'booked')
-                ->where('starts_at', '<', $endUtc->format('Y-m-d H:i:s.u'))
-                ->where('ends_at', '>', $startUtc->format('Y-m-d H:i:s.u'))
-                ->exists();
+            $slotStartTs = $slotStartUtc->getTimestamp();
+            $slotEndTs = $slotEndUtc->getTimestamp();
 
+            $overlap = false;
+            foreach ($bookedIntervals as $interval) {
+                if ($slotStartTs < $interval['end'] && $slotEndTs > $interval['start']) {
+                    $overlap = true;
+                    break;
+                }
+            }
+            
             if (!$overlap) {
-                $slots[] = $t->format('H:i');
+                $slots[] = $cursor->format('H:i');
             }
         }
 
